@@ -3,7 +3,7 @@
 所有渠道进来的信息统一为"线索卡片"，研究员挑选后转为研究立项，之后完全走现有的治理流程。
 
 - 人工渠道：投资假设、论文 / 研报（上传文件或粘贴摘要）、研究员经验、人工反馈；
-- 自动回流：监控预警（加强观察 / 建议暂停）、组合归因建议（进一步研究 / 重新校准 / 限定地区 / 停用）、
+- 自动回流：监控预警（加强观察 / 建议暂停）、模拟盘反馈（模拟盘运行建议）、组合归因建议（进一步研究 / 重新校准 / 限定地区 / 停用）、
   审批退回 / 拒绝；打开线索池时同步，按来源去重。
 - 提交检查：敏感信息（格式明确的个人信息，命中即拒绝）、论文来源与许可必填、相似研究与线索提示、地区可见范围。
 - 论文抽取：pypdf 抽取段落 → 大模型抽取候选因子（每个须引用段落，标注数据可得性）→ 防泄漏提示（样本期 / 发表日期
@@ -38,6 +38,7 @@ CHANNELS = {
     "experience": {"zh": "研究员经验", "manual": True},
     "feedback": {"zh": "人工反馈", "manual": True},
     "monitor": {"zh": "监控预警", "manual": False},
+    "paper_trading": {"zh": "模拟盘反馈", "manual": False},
     "portfolio": {"zh": "组合归因建议", "manual": False},
     "approval": {"zh": "审批退回 / 拒绝", "manual": False},
 }
@@ -531,6 +532,25 @@ def sync() -> int:
                               f"研究 {rid} v{v} 的授权组合归因建议「{fb['action_zh']}」（{MARKET_ZH[fb['market']]}）。原因："
                               + "；".join(fb.get("reasons") or []), [fb["market"]], {"research": f"{rid}.v{v}", "market": fb["market"], "action": fb["action"]})
     except Exception:
+        pass
+    try:
+        from factopia import paper as PT
+        for r in PT.enrolled():
+            sid = r["signal_id"]
+            res = PT.result(sid)
+            if not res or res.get("suggestion") not in ("watch", "pause"):
+                continue
+            al = "；".join(a["title"] for a in res.get("alerts") or [])
+            nav = res.get("nav") or {}
+            exc = (res.get("excess") or {}).get("ann")
+            ric = (res.get("rank_ic") or {}).get("mean")
+            _auto(f"paper_trading:{sid}:{res['computed_at']}", idx, "paper_trading",
+                  f"{MARKET_ZH.get(r['market'], r['market'])}模拟盘{ {'watch': '加强观察', 'pause': '建议暂停'}[res['suggestion']] }：{sid}",
+                  f"信号 {sid} 的模拟盘（{'影子撮合' if r.get('mode') == 'shadow' else '长桥'}，{res.get('start') or '—'} 起）建议：{res['suggestion_zh']}。"
+                  f"预警：{al or '—'}；最新净值 {nav.get('last') or '—'}，最大回撤 {nav.get('max_drawdown') if nav.get('max_drawdown') is not None else '—'}，"
+                  f"超额年化 {exc if exc is not None else '—'}，rank IC 均值 {ric if ric is not None else '—'}。",
+                  [r["market"]], {"signal_id": sid, "computed_at": res["computed_at"]})
+    except Exception:                                   # 模拟盘模块不可用时跳过
         pass
     if len(idx) != before:
         tmp = DIR / "sources.json.tmp"

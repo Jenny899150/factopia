@@ -2,7 +2,8 @@
 
 研究员给出假设（中 / 英 / 法文）、授权、市场与周期；系统先计算证据包与授权约束，再请大模型起草规格，
 输出按 JSON 结构校验；数据缺口、自由文本授权条款与测试期年份由系统补充为待确认事项。
-大模型使用与 RD-Agent 相同的 .env 配置（CHAT_MODEL / DEEPSEEK_API_KEY），可用 FACTOPIA_LLM_* 覆盖。
+大模型使用与 RD-Agent 相同的 .env 配置（CHAT_MODEL=litellm_proxy/... + LITELLM_PROXY_API_KEY 与
+LITELLM_PROXY_API_BASE，硅基流动等 OpenAI 兼容端点），可用 FACTOPIA_LLM_* 覆盖。
 """
 import json
 import os
@@ -46,12 +47,21 @@ def llm_config() -> dict:
     if base and model and key:
         return {"base_url": base.rstrip("/"), "model": model, "api_key": key}
     chat = os.environ.get("CHAT_MODEL", "")
+    if chat.startswith("litellm_proxy/") and os.environ.get("LITELLM_PROXY_API_KEY") and os.environ.get("LITELLM_PROXY_API_BASE"):
+        return {"base_url": os.environ["LITELLM_PROXY_API_BASE"].rstrip("/"), "model": chat.split("/", 1)[1],
+                "api_key": os.environ["LITELLM_PROXY_API_KEY"]}
+    if chat.startswith("zhipu/") and os.environ.get("ZHIPUAI_API_KEY"):
+        return {"base_url": "https://open.bigmodel.cn/api/paas/v4", "model": chat.split("/", 1)[1],
+                "api_key": os.environ["ZHIPUAI_API_KEY"]}
     if chat.startswith("deepseek/") and os.environ.get("DEEPSEEK_API_KEY"):
         return {"base_url": "https://api.deepseek.com", "model": chat.split("/", 1)[1], "api_key": os.environ["DEEPSEEK_API_KEY"]}
-    raise DraftError("未配置大模型：在 .env 中设置 CHAT_MODEL=deepseek/... 与 DEEPSEEK_API_KEY，或 FACTOPIA_LLM_BASE_URL / MODEL / API_KEY")
+    raise DraftError("未配置大模型：在 .env 中设置 CHAT_MODEL=litellm_proxy/... 与 LITELLM_PROXY_API_KEY"
+                     "（外加 LITELLM_PROXY_API_BASE，如硅基流动），或 FACTOPIA_LLM_BASE_URL / MODEL / API_KEY")
 
 
 def _chat(prompt: str, cfg: dict) -> tuple[str, dict]:
+    if "json" not in prompt.lower():  # DeepSeek 的 json_object 模式要求 prompt 含 "json" 字样
+        prompt += "\nRespond with a single JSON object."
     body = json.dumps({"model": cfg["model"], "temperature": 0.3, "response_format": {"type": "json_object"},
                        "messages": [{"role": "user", "content": prompt}]}).encode()
     req = urllib.request.Request(f"{cfg['base_url']}/chat/completions", data=body, method="POST",
