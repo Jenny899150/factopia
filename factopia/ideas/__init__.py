@@ -8,6 +8,7 @@
 - 提交检查：敏感信息（格式明确的个人信息，命中即拒绝）、论文来源与许可必填、相似研究与线索提示、地区可见范围。
 - 论文抽取：pypdf 抽取段落 → 大模型抽取候选因子（每个须引用段落，标注数据可得性）→ 防泄漏提示（样本期 / 发表日期
   与测试期重叠或未知）。
+- 合并转立项：多条线索由 AI 合成一个研究假设，或追加到已有研究生成新版本（combine.py，第 17.12 节）。
 - 留痕：每条线索 events.jsonl 只追加、哈希链。
 
 存储：runtime/ideas/<id>/（idea.json、events.jsonl、files/），自动回流去重索引 runtime/ideas/sources.json。
@@ -290,7 +291,7 @@ def create(body: dict) -> dict:
         idea["leakage"] = leakage(idea["document"])
     sg = body.get("ai_suggestion") or None                 # 采用了 AI 默认假设（第 17.11 节）：记录原稿与是否经人修改（BR-46）
     if sg and ch != "paper":
-        idea["ai_suggested"] = {k: sg.get(k) for k in ("id", "title", "body", "model", "prompt_version", "angle", "why_zh", "grounds")} | {
+        idea["ai_suggested"] = {k: sg.get(k) for k in ("id", "title", "body", "model", "prompt_version", "angle", "why_zh", "grounds", "selection", "seed", "focus_market", "candidates", "evidence", "dimensions", "table", "inputs", "prompt")} | {
             "edited": str(sg.get("title") or "").strip() != title or str(sg.get("body") or "").strip() != text}
     idea["similar"] = similar(idea)
     _save(idea)
@@ -345,7 +346,7 @@ def extract(iid: str, by: str = SYSTEM_BY) -> dict:
         truncated="yes" if len(numbered) < len(paras) else "no")
     cfg = drafting.llm_config()
     try:
-        text, usage = drafting._chat(prompt, cfg)
+        text, usage = drafting._chat(prompt, cfg, "论文因子抽取")
         raw = json.loads(text)
     except json.JSONDecodeError as e:
         raise IdeaError(f"大模型输出不是合法 JSON：{e}") from e
@@ -449,7 +450,7 @@ def confirm_questions(iid: str, idea: dict | None = None) -> list[str]:
     return out
 
 
-def mark_converted(iid: str, research_id: str, version: int, by: str) -> None:
+def mark_converted(iid: str, research_id: str, version: int, by: str, combo: str | None = None) -> None:
     try:
         idea = load(iid)
     except IdeaError:
@@ -460,7 +461,7 @@ def mark_converted(iid: str, research_id: str, version: int, by: str) -> None:
     if ref not in idea["links"]["research"]:
         idea["links"]["research"].append(ref)
     _save(idea)
-    _append(iid, {"action": "convert", "by": by, "research": ref})
+    _append(iid, {"action": "convert", "by": by, "research": ref, **({"note": f"合并转立项 {combo}", "combo": combo} if combo else {})})
 
 
 def lineage(iid: str) -> dict | None:
@@ -495,18 +496,37 @@ def _auto(key: str, idx: dict, channel: str, title: str, body: str, markets: lis
     idx[key] = iid
 
 
+def _migrate_monitor_keys(idx: dict) -> None:
+    """旧的监控线索去重键含计算时间（monitor:<信号>:<时间>），改为按结论（monitor:<信号>:<watch|pause>），
+    避免改键后为已有线索再生成一张。旧键保留。"""
+    for k, iid in list(idx.items()):
+        parts = k.split(":", 2)
+        if parts[0] != "monitor" or len(parts) < 3 or parts[2] in ("watch", "pause"):
+            continue
+        try:
+            title = load(iid)["title"]
+        except Exception:
+            continue
+        sug = "pause" if "建议暂停" in title else "watch" if "加强观察" in title else None
+        if sug:
+            idx.setdefault(f"monitor:{parts[1]}:{sug}", iid)
+
+
 def sync() -> int:
     """把平台内部的监控预警、组合归因建议、审批退回 / 拒绝同步为线索（按来源去重）。返回新增数量。"""
     DIR.mkdir(parents=True, exist_ok=True)
     idx = _sources()
-    before = len(idx)
+    original = len(idx)
+    _migrate_monitor_keys(idx)
+    before = len(idx)                                  # 迁移的旧键不计为新增
     try:
         from factopia import approval, signals
         for e in signals.catalog():
             mon = signals.monitor_result(e["signal_id"])
             if mon and mon.get("suggestion") in ("watch", "pause"):
                 al = "；".join(a["title"] for a in mon.get("alerts") or [])
-                _auto(f"monitor:{e['signal_id']}:{mon['computed_at']}", idx, "monitor",
+                # 同一信号同一种结论只保留一张线索；结论变化（如加强观察 → 建议暂停）时才新建（重算监控不重复生成）
+                _auto(f"monitor:{e['signal_id']}:{mon['suggestion']}", idx, "monitor",
                       f"{e['market_zh']}信号{ {'watch': '加强观察', 'pause': '建议暂停'}[mon['suggestion']] }：{e['title']}",
                       f"信号 {e['signal_id']}（{e['state_zh']}）上线后监控建议：{mon['suggestion_zh']}。预警：{al or '—'}。\n诊断："
                       + "；".join(mon.get("diagnosis") or []), [e["market"]], {"signal_id": e["signal_id"], "computed_at": mon["computed_at"]})
@@ -525,12 +545,26 @@ def sync() -> int:
         for rid in store.research_ids():
             for v in store.versions(rid):
                 summ = P.load(rid, v)
+                # 研究员已记录决定的市场以决定为准；尚未决定的用平台建议（BR-32：平台建议，研究员决定）
+                decided = {}
+                for d in P.feedback(rid, v):
+                    decided[d["market"]] = d                       # 按时间追加，最后一条为最新决定
                 for fb in (summ or {}).get("feedback") or []:
-                    if fb["action"] in ("research", "recalibrate", "restrict", "retire"):
-                        _auto(f"portfolio:{rid}.v{v}:{fb['market']}:{fb['action']}", idx, "portfolio",
-                              f"{MARKET_ZH[fb['market']]}组合建议{fb['action_zh']}：{rid} v{v}",
-                              f"研究 {rid} v{v} 的授权组合归因建议「{fb['action_zh']}」（{MARKET_ZH[fb['market']]}）。原因："
-                              + "；".join(fb.get("reasons") or []), [fb["market"]], {"research": f"{rid}.v{v}", "market": fb["market"], "action": fb["action"]})
+                    d = decided.get(fb["market"])
+                    action = d["action"] if d else fb["action"]
+                    if action not in ("research", "recalibrate", "restrict", "retire"):
+                        continue
+                    action_zh = P.ACTIONS[action]
+                    if d:
+                        title = f"{MARKET_ZH[fb['market']]}组合决定{action_zh}：{rid} v{v}"
+                        body = (f"研究 {rid} v{v}（{MARKET_ZH[fb['market']]}）研究员决定「{action_zh}」（{d.get('by') or '研究员'}，{str(d.get('at', ''))[:16].replace('T', ' ')}）"
+                                + (f"，说明：{d['note']}" if d.get("note") else "") + f"。平台建议为「{fb['action_zh']}」，原因：" + "；".join(fb.get("reasons") or []))
+                    else:
+                        title = f"{MARKET_ZH[fb['market']]}组合建议{action_zh}：{rid} v{v}"
+                        body = (f"研究 {rid} v{v} 的授权组合归因建议「{action_zh}」（{MARKET_ZH[fb['market']]}，研究员尚未记录决定）。原因："
+                                + "；".join(fb.get("reasons") or []))
+                    _auto(f"portfolio:{rid}.v{v}:{fb['market']}:{action}", idx, "portfolio", title, body, [fb["market"]],
+                          {"research": f"{rid}.v{v}", "market": fb["market"], "action": action, "source": "decision" if d else "suggestion"})
     except Exception:
         pass
     try:
@@ -544,7 +578,7 @@ def sync() -> int:
             nav = res.get("nav") or {}
             exc = (res.get("excess") or {}).get("ann")
             ric = (res.get("rank_ic") or {}).get("mean")
-            _auto(f"paper_trading:{sid}:{res['computed_at']}", idx, "paper_trading",
+            _auto(f"paper_trading:{sid}:{res['suggestion']}", idx, "paper_trading",
                   f"{MARKET_ZH.get(r['market'], r['market'])}模拟盘{ {'watch': '加强观察', 'pause': '建议暂停'}[res['suggestion']] }：{sid}",
                   f"信号 {sid} 的模拟盘（{'影子撮合' if r.get('mode') == 'shadow' else '长桥'}，{res.get('start') or '—'} 起）建议：{res['suggestion_zh']}。"
                   f"预警：{al or '—'}；最新净值 {nav.get('last') or '—'}，最大回撤 {nav.get('max_drawdown') if nav.get('max_drawdown') is not None else '—'}，"
@@ -552,7 +586,7 @@ def sync() -> int:
                   [r["market"]], {"signal_id": sid, "computed_at": res["computed_at"]})
     except Exception:                                   # 模拟盘模块不可用时跳过
         pass
-    if len(idx) != before:
+    if len(idx) != original:
         tmp = DIR / "sources.json.tmp"
         tmp.write_text(json.dumps(idx, ensure_ascii=False, indent=0), encoding="utf-8")
         tmp.replace(DIR / "sources.json")

@@ -5,7 +5,7 @@ import { api, visibleMarkets, type KnowledgeSearch, type LibraryItem } from "../
 import { MARKET_LABEL, useAsync } from "../lib";
 
 // 因子库与知识检索（Spec 第 14.18 节；BR-25、35）：内部因子库（Alpha158、获批信号、团队专有因子接口）
-// 与跨中 / 英 / 法的语义检索（因子库、内部研究、数据字典、经批准的外部公告）
+// 与跨中 / 英 / 法的语义检索（因子库、内部研究、字段口径、经批准的外部公告）
 
 type Src = "all" | LibraryItem["source"];
 const SOURCES: { value: Src; label: string }[] = [
@@ -115,22 +115,27 @@ export default function LibraryPage() {
               <th className="text-left font-normal pr-2">来源 / 状态</th>
               <th className="text-left font-normal pr-2">说明</th>
               {visibleMarkets().map((m) => <th key={m} className="text-right font-normal pr-2">{MARKET_LABEL[m]} t</th>)}
-              <th className="text-left font-normal pr-2">迁移标签</th>
+              <th className="text-left font-normal pr-2 whitespace-nowrap">迁移标签</th>
             </tr></thead>
             <tbody>
               {items.map((i) => (
                 <tr key={i.id} className="border-t border-line align-top">
                   <td className="py-1 pr-2 num whitespace-nowrap">{i.name}</td>
-                  <td className="pr-2 whitespace-nowrap"><Badge tone={i.source === "approved" ? "good" : i.source === "proprietary" ? "accent" : "muted"}>{i.status}</Badge>
+                  <td className="pr-2 whitespace-nowrap"><Badge tone={i.source === "approved" ? (i.approved_markets?.length ? "good" : "warn") : i.source === "proprietary" ? "accent" : "muted"}>{i.status}</Badge>
+                    {i.source === "approved" && <div className="mt-0.5">
+                      {i.approved_markets?.length ? <span className="text-good">获批：{i.approved_markets.map((m) => MARKET_LABEL[m]).join("、")}</span> : null}
+                      {i.unapproved_markets?.length ? <span className="text-warn">{i.approved_markets?.length ? "；" : ""}未获批：{i.unapproved_markets.map((m) => MARKET_LABEL[m]).join("、")}</span> : null}
+                    </div>}
                     <div className="text-faint mt-0.5">{i.group}</div></td>
                   <td className="pr-2 min-w-[16rem]">{i.description}
                     {i.source === "approved" && <div className="text-faint mt-0.5">{i.period_note}</div>}</td>
                   {visibleMarkets().map((m) => {
                     const x = i.markets[m];
                     return <td key={m} className="pr-2 text-right num whitespace-nowrap">{tCell(x?.t)}
+                      {i.source === "approved" && x && !x.approved && <div className="text-warn">未获批</div>}
                       {x?.state && <div className="text-faint">{x.state}</div>}</td>;
                   })}
-                  <td className="pr-2">{i.label ?? "—"}</td>
+                  <td className="pr-2 whitespace-nowrap">{i.label ?? "—"}</td>
                 </tr>
               ))}
             </tbody>

@@ -126,11 +126,12 @@ export type DraftResult = {
   };
   evidence: { groups: string[]; alpha158: EvidenceAlpha[]; internal?: InternalEvidence[]; past_runs: { run_id: string; market: Market; loop: number; hypothesis: string; adopted: boolean }[] };
   mandate: Mandate;
-  meta: { model: string; prompt_version: string; prompt_tokens: number; completion_tokens: number; seconds: number; at: string; idea_id?: string | null };
+  meta: { model: string; prompt_version: string; prompt_tokens: number; completion_tokens: number; seconds: number; at: string; idea_id?: string | null;
+    idea_ids?: string[]; combo_id?: string | null; based_on?: string | null };
 };
 export type DraftInput = {
   hypothesis: string; direction: string; markets: Market[]; horizon: number; mandate: string; groups: string[]; include_past_runs: boolean;
-  idea_id?: string | null;
+  idea_id?: string | null; idea_ids?: string[]; combo_id?: string | null; based_on?: string | null;
 };
 export type RegionDiff = {
   markets: Market[]; markets_version: string; rule_packs: Partial<Record<Market, string>>; differs: number; note: string;
@@ -145,7 +146,7 @@ export type Spec = {
   evidence: { groups: string[]; include_past_runs: boolean; items: string[] }; questions: Question[];
   run: { loops: number; budget_usd: number }; signal_source?: SignalSource; region_diff?: RegionDiff;
   ai_draft: DraftResult["meta"] & { original: Pick<Spec, "hypothesis" | "rationale" | "directions" | "exclusions" | "falsification"> };
-  locked_at?: string; locked_by?: string; precheck_setup?: Precheck; edits?: { field: string; by: string; at: string }[]; past_runs?: string[];
+  based_on?: string | null; locked_at?: string; locked_by?: string; precheck_setup?: Precheck; edits?: { field: string; by: string; at: string }[]; past_runs?: string[];
 };
 export type JobState = "queued" | "running" | "done" | "failed" | "cancelled" | "budget_stopped";
 export type Job = {
@@ -190,10 +191,10 @@ export type Validation = {
   placebo?: { n: number; runs: { seed: number; annual_return_with_cost: number | null; max_drawdown_with_cost: number | null; rank_ic: number | null }[];
     share_ge_ai: number | null; share_ge_baseline: number | null; median: number | null };
 };
-export type CredCheck = { key: "significance" | "holdout" | "reproduce" | "placebo"; label: string; ok: boolean | null; value: any };
+export type CredCheck = { key: "significance" | "ties" | "robust_test" | "holdout" | "reproduce" | "placebo"; label: string; ok: boolean | null; value: any };
 export type Credibility = {
   state: "unchecked" | "pending" | "credible" | "doubtful"; label: string; checks: CredCheck[];
-  noise: { range: [number, number] | null; seeds: number | null; reported: number | null } | null;
+  noise: { range: [number, number] | null; median?: number | null; seeds: number | null; reported: number | null; deterministic?: boolean } | null;
 };
 export type Diagnostics = {
   run_id: string; round: string; market: Market; horizon: number; base_currency: string; backtest_note: string;
@@ -275,6 +276,8 @@ export type TextDataset = {
   processing_delay_min: number; ready: boolean; n_filings: number; n_companies: number; n_changes: number;
   hold_days: number | null; evaluation: TextEval | null;
   truth: { label: string; rule: string; expected: string; companies: number; filings: number } | null;
+  sensitivity?: { rows: { delay_min: number; hold_days: number; rank_ic_mean: number | null; rank_ic_t: number | null; event_diff_t: number | null;
+    n_days: number; verdict: string; baseline: boolean }[]; stable: boolean; verdicts: string[]; note: string } | null;
 };
 export type TextCompareRow = {
   dataset: string; market: Market; simulated: boolean; n_filings: number; n_companies: number;
@@ -283,10 +286,24 @@ export type TextCompareRow = {
   event_diff_t?: number | null; verdict: string;
 };
 export type TextOverview = {
-  datasets: TextDataset[]; compare: { horizon: number; markets: TextCompareRow[]; note: string } | null;
-  glossary_version: string; review_counts: { pending: number; done: number };
+  datasets: TextDataset[]; compare: { horizon: number; markets: TextCompareRow[]; note: string; rule?: string } | null;
+  glossary_version: string; review_counts: { pending: number; done: number; pending_real?: number; pending_simulated?: number; must_real?: number };
   concepts: { concept: string; zh: string; en: string; fr: string; terms: Record<string, string[]> }[];
+  pipeline?: { screening: "glossary" | "full"; review: { sample_size: number; sample_unscreened: number; sample_seed: number; high_impact_top: number; must_flags: string[] } };
+  glossary_additions?: GlossaryAddition[];
 };
+export type ReviewTier = "must" | "sample" | "impact" | "other";
+export type ReviewCounts = { pending: number; done: number; tiers: Record<ReviewTier, { pending: number; done: number }> };
+export type AccuracyRow = { group: string; group_zh: string; correct: number; reviewed: number; accuracy: number; ci95: [number, number] | null };
+export type ReviewAccuracy = { dataset: string; sample_size: number; pool: number; reviewed: number; rows: AccuracyRow[];
+  unscreened: { sample_size: number; reviewed: number; missed: number; miss_rate: number | null; ci95: [number, number] | null };
+  screening: string; note: string };
+export type GlossaryAddition = { concept: string; lang: string; term: string; by: string; at: string; candidate_id: string; note: string; edited: boolean };
+export type GlossaryCandidate = { id: string; dataset: string; concept: string; concept_zh: string; lang: string; term: string; count: number;
+  examples: { doc_id: string; i: number; text: string; direction: number }[]; status: "pending" | "approved" | "rejected";
+  decided_by?: string; decided_at?: string; note?: string; final_term?: string | null; created_at: string };
+export type GlossaryCandidates = { candidates: GlossaryCandidate[]; additions: GlossaryAddition[]; glossary_version: string;
+  runs: { at: string; dataset: string; model: string; sampled: number; with_risk: number; candidates: number; added: number; usd: number; stopped: string | null }[] };
 export type TextCitation = { i: number; concept: string; name: string; value: number; negated: boolean; evidence: string; review: string; text: string };
 export type TextFiling = {
   id: string; instrument: string; company: string; title: string; language: string; subtype: string | null; url: string | null;
@@ -344,18 +361,25 @@ export type RefSummary = {
   vendor_imports?: { kind: "membership" | "actions"; vendor: string; market?: string; rows: number; at: string }[];
   vendor_templates?: string;
 };
-export type DictField = { name: string; zh: string; unit: string; source: string; adjustment: string; available: string; note?: string };
+export type DictField = { name: string; zh: string; unit: string; source: string; adjustment: string; available: string; note?: string; group?: string; formula?: string };
+export type MarketRule = {
+  name: string; exchange: string; timezone: string; currency: string; close_local: string; eod_delay_min: number;
+  reporting: string; accounting_default: string; trading_hours?: string; price_limits?: string; settlement?: string;
+  short_selling?: string; lot_size?: string; disclosure_language?: string; benchmark?: string; holidays?: string;
+};
 export type RefDictionary = {
   fields: { version: string; fields: DictField[] };
-  markets: { version: string; markets: Record<Market, { name: string; exchange: string; timezone: string; currency: string;
-    close_local: string; eod_delay_min: number; reporting: string; accounting_default: string }> };
+  markets: { version: string; markets: Record<Market, MarketRule>; accounting_by_jurisdiction?: Record<string, string>;
+    cross_listing_venues?: Record<string, string> };
   membership: Record<string, { rows: number; sources: Record<string, number>; point_in_time: boolean }>;
+  text_delay_min?: Record<string, number>;
 };
 export type ReviewDecision = { key: string; action: string; reviewer: string; note: string; at: string; concepts: TextConcept[] | null; translation: Record<string, string> | null };
 export type ReviewItem = {
   key: string; dataset: string; doc_id: string; i: number; simulated: boolean; company: string; instrument: string; title: string;
   published_at: string; language: string; language_zh: string; original: string; translation: Record<string, string>;
   translation_confidence: number | null; model: string; glossary_version: string; method: string;
+  tier: ReviewTier; tier_zh: string; sample_kind: "screened" | "unscreened" | null;
   concepts: TextConcept[]; model_concepts: TextConcept[]; flags: TextFlag[]; decision: ReviewDecision | null; history: ReviewDecision[];
 };
 export type ReviewIn = { dataset: string; doc_id: string; i: number; action: string; reviewer: string; note?: string;
@@ -384,7 +408,12 @@ export type RulePacks = {
   sources: { version: string; owner: string; last_review: string; sources: Record<string, DataSource>;
     category_sources: Record<string, Partial<Record<Market, string>>>; always: string[] };
 };
+export type RuleHandling = {
+  submission_id: string; status: string; status_zh: string; created_at: string; frozen: string[]; earlier_submissions: number;
+  items: Record<string, { role: string; action: string | null; action_zh: string | null; note: string | null; at: string | null; by: string | null }[]>;
+};
 export type VersionRules = { research_id: string; version: number; setup: Precheck; portfolio: Precheck | null; portfolio_note: string | null;
+  handling?: RuleHandling | null;
   focus: Record<string, { run_id: string | null; loop: number | string | null }>; overrides: Record<string, unknown>;
   portfolio_source?: Record<string, string> };
 
@@ -435,7 +464,8 @@ export type Submission = {
   rule_decisions: Record<string, { rule: string; action: string; by: string; role: string; note: string; at: string }>;
   materials: { title: string; hypothesis: string; report: { name: string; sha256: string }; code_fingerprint: string;
     data_snapshot: Record<string, string | null>; rule_packs: Record<string, string>;
-    results: Record<string, { run_id: string | null; loop: number | string | null; rank_ic: number | null; rank_ic_t: number | null; credibility: string | null }>;
+    results: Record<string, { run_id: string | null; loop: number | string | null; rank_ic: number | null; rank_ic_t: number | null; credibility: string | null;
+      return_single?: number | null; return_median?: number | null; return_range?: [number, number] | null; ties?: number | null }>;
     prechecks: { setup: Precheck; portfolio: Precheck }; transfer: { label: string } | null };
   lock: null | { locked_at: string; deployment: Market[]; thresholds: Record<string, number>; applicability: Record<string, string>; by: string;
     labels?: { headline: string; flags: string[]; display: string; markets: Record<string, { label: string; tags: string[]; reasons: string[] }> };
@@ -450,6 +480,7 @@ export type ApprovalAct = { role: string; action: string; note?: string; rule?: 
 export type SignalEntry = {
   signal_id: string; research_id: string; version: number; market: Market; market_zh: string; title: string; submission: string;
   state: string; state_zh: string; reason: string | null; production: boolean;
+  resubmission?: { submission: string; status: string; status_zh: string; current_role: string | null; created_at: string; note: string } | null;
   labels: { languages: string[]; mandate: string; data_scope: { categories: string[]; universe: string; snapshot: string };
     rule_versions: string[]; last_validated: string | null; next_review: string | null; applicability?: string | null;
     regional?: { headline: string; display: string; tags: string[]; reasons: string[] } | null };
@@ -514,7 +545,8 @@ export type Acceptance = {
       tasks: { task: string; hours_each: number; manual_times: number; platform_human_times: number }[] };
     citation: { shown: number; cited: number; coverage: number | null; model_dropped: number; model_compliance: number | null; target: number; scope: string };
     reproducibility: { rate: number | null; target: number; criteria: string;
-      items: { signal: string; ok: boolean; factor_match?: number; range_width?: number | null; reason: string | null }[] };
+      items: { signal: string; ok: boolean; factor_match?: number; rank_ic?: (number | null)[]; return?: (number | null)[];
+        deterministic?: boolean; tie_range?: (number | null)[]; tie_range_width?: number | null; reason: string | null }[] };
   };
 };
 
@@ -566,7 +598,8 @@ export type Idea = {
   similar?: { research: { kind: string; kind_zh: string; title: string; ref: string; score: number }[];
     ideas: { id: string; title: string; channel_zh: string; overlap: number }[]; note: string };
   extract_error?: string;
-  ai_suggested?: { id: string; title: string; body: string; model: string; prompt_version: string; angle: string; why_zh: string; grounds: string[]; edited: boolean };
+  ai_suggested?: { id: string; title: string; body: string; model: string; prompt_version: string; angle: string; why_zh: string; grounds: (string | IdeaGround)[]; edited: boolean;
+    selection?: string[]; seed?: string };
   ai_hypothesis?: IdeaAiHypothesis;
 };
 export type IdeaDetail = Idea & { events: { action: string; by: string; note?: string; at: string; hash: string; target?: string; research?: string }[];
@@ -580,14 +613,31 @@ export type IdeaInput = { channel: IdeaChannel; title: string; body: string; mar
     sample_start?: string; sample_end?: string };
   ai_suggestion?: IdeaSuggestion | null };
 export type IdeaSuggestion = { id: string; channel: IdeaChannel; title: string; body: string; direction: string; period: string; feedback_role: string;
-  markets: Market[]; why_zh: string; grounds: string[]; angle: string; model: string; prompt_version: string; at: string };
+  markets: Market[]; why_zh: string; grounds: (string | IdeaGround)[]; angle: string; model: string; prompt_version: string; at: string;
+  focus_market?: Market | null; selection?: string[]; candidates?: { angle: string; market: Market; score: number }[]; seed?: string; evidence_n?: number;
+  evidence?: { id: string; kind: string; zh: string; en: string; cited: boolean }[];
+  dimensions?: { key: string; label: string; rule: string }[];
+  table?: { angle: string; market: Market; score: number; by_market: Partial<Record<Market, number>>; detail: Record<string, { points: number; note: string }>;
+    counts: { studies: number; rounds: number; adopted: number; exclusions: number; ideas: number }; groups: string[]; keywords: string;
+    skipped: boolean; top: boolean; chance: number | null; selected: boolean }[];
+  inputs?: { used: { name: string; source: string; count: number; use: string; items: string[] }[]; not_used: { name: string; why: string }[];
+    avoid_n: number; session_avoid_n: number };
+  prompt?: string };
+export type IdeaGround = { kind: string; text: string };
 export type IdeaAiHypothesis = { title: string; hypothesis: string; direction: string; why_zh: string; model: string; prompt_version: string; at: string };
+export type IdeaCombo = { id: string; by: string; at: string; idea_ids: string[];
+  base: { id: string; version: number; title: string; inherited: string[] } | null;
+  sources: { tag: string; id: string; channel_zh: string; title: string; markets: Market[] }[];
+  title: string; hypothesis_cited: string; hypothesis: string; direction: string; why_zh: string;
+  uses: { tag: string; how_zh: string }[]; unused: string[]; conflicts: string[]; not_testable: string[];
+  markets: Market[]; questions: string[]; model: string; prompt_version: string };
 export type IdeaPrefill = { idea_id: string; hypothesis: string; direction: string; markets: Market[]; questions: string[]; channel_zh: string; title: string };
 
 // ---------------------------------------------------------------- 因子库与语义检索（BR-25、35）
 export type LibraryItem = {
   id: string; name: string; source: "alpha158" | "approved" | "proprietary"; status: string; group: string | null;
   description: string | null; formulation: string | null; code: string | null; label: string | null; period_note: string | null; provenance: string;
+  approved_markets?: Market[]; unapproved_markets?: Market[];
   markets: Partial<Record<Market, { rank_ic: number | null; t: number | null; credibility?: string | null; state?: string | null; approved?: boolean; simulated?: boolean }>>;
 };
 export type Library = { summary: { total: number; by_source: Record<string, number>; proprietary_dir: string }; items: LibraryItem[] };
@@ -667,7 +717,9 @@ export const api = {
   dictionary: () => get<RefDictionary>("/refdata/dictionary"),
   textOverview: () => get<TextOverview>("/text/overview"),
   textFilings: (ds: string, instrument?: string) =>
-    get<{ dataset: string; simulated: boolean; source: string; licence: string; total: number; items: TextFiling[] }>(
+    get<{ dataset: string; simulated: boolean; source: string; licence: string; total: number; items: TextFiling[];
+      excluded?: { id: string; instrument: string; company: string; title: string; language: string; published_at: string; n_paragraphs: number; reason: string }[];
+      cleaning?: { table_paragraphs: number; series_filter: { datasets: string[]; min_paragraphs: number; notice_max_paragraphs: number }; table_rows: { enabled: boolean; numeric_share: number } } }>(
       `/text/${ds}/filings${instrument ? `?instrument=${encodeURIComponent(instrument)}` : ""}`),
   textDoc: (ds: string, id: string) => get<TextDoc>(`/text/${ds}/filings/${id}`),
   textSearch: (q: string, datasets: string[] = [], concepts: string[] = []) => {
@@ -677,9 +729,13 @@ export const api = {
     return get<{ query: string; concepts: { concept: string; name: string; terms: string[] }[]; results: TextHit[]; truncated: boolean }>(`/text/search?${p}`);
   },
   textSummary: (q: string, concepts: string[] = []) => post<TextSummary>("/text/summary", { q, concept: concepts.length ? concepts : null }),
-  textReview: (status: "pending" | "done" | "all", dataset?: string) =>
-    get<{ items: ReviewItem[]; counts: { pending: number; done: number }; actions: Record<string, string> }>(
-      `/text/review?status=${status}&limit=60${dataset ? `&dataset=${dataset}` : ""}`),
+  textReview: (status: "pending" | "done" | "all", dataset?: string, tier: ReviewTier | "all" = "all") =>
+    get<{ items: ReviewItem[]; counts: ReviewCounts; actions: Record<string, string>; tiers_zh: Record<ReviewTier, string> }>(
+      `/text/review?status=${status}&limit=60&tier=${tier}${dataset ? `&dataset=${dataset}` : ""}`),
+  textAccuracy: () => get<{ datasets: ReviewAccuracy[] }>("/text/review/accuracy"),
+  glossaryCandidates: () => get<GlossaryCandidates>("/text/glossary/candidates"),
+  glossaryDecide: (id: string, body: { action: "approve" | "reject"; by: string; note?: string; term?: string | null }) =>
+    post<GlossaryCandidate>(`/text/glossary/candidates/${id}`, body),
   textDecide: (body: ReviewIn) => post<ReviewDecision>("/text/review", body),
   overview: () => get<Overview>("/overview"),
   cube: (h: number) => get<Cube>(`/alpha158/${h}/cube`),
@@ -712,6 +768,8 @@ export const api = {
   job: (id: string) => get<JobDetail>(`/jobs/${id}`),
   cancelJob: (id: string) => post<{ ok: boolean }>(`/jobs/${id}/cancel`, {}),
   jobLive: (id: string) => get<LiveState | Record<string, never>>(`/jobs/${id}/live`),
+  resumeInfo: (id: string) => get<{ ok: boolean; reason?: string; complete?: number; remaining?: number; checkpoint?: string }>(`/jobs/${id}/resume`),
+  resumeJob: (id: string, budget_usd?: number) => post<Job>(`/jobs/${id}/resume`, { budget_usd: budget_usd ?? null }),
   retryJob: (id: string) => post<{ batch_id: string; jobs: Job[] }>(`/jobs/${id}/retry`, {}),
   runner: () => get<RunnerStatus>("/runner"),
   resumeRunner: () => post<RunnerStatus>("/runner/resume", {}),
@@ -723,6 +781,8 @@ export const api = {
   extractIdea: (id: string, by: string) => post<Idea>(`/ideas/${id}/extract?by=${encodeURIComponent(by)}`, {}),
   ideaAct: (id: string, body: { action: string; by: string; note?: string; target?: string }) => post<Idea>(`/ideas/${id}/act`, body),
   ideaPrefill: (id: string, factors: string[]) => post<IdeaPrefill>(`/ideas/${id}/convert`, { factors }),
-  ideaSuggest: (channel: IdeaChannel, markets: Market[], avoid: string[]) => post<IdeaSuggestion>("/ideas/suggest", { channel, markets, avoid }),
+  ideaSuggest: (channel: IdeaChannel, markets: Market[], avoid: string[], seed = "", skip_angle: string | null = null) =>
+    post<IdeaSuggestion>("/ideas/suggest", { channel, markets, avoid, seed, skip_angle }),
+  ideaCombine: (ids: string[], by: string, base: string | null) => post<IdeaCombo>("/ideas/combine", { ids, by, base }),
   ideaAiHypothesis: (id: string) => post<Idea>(`/ideas/${id}/ai-hypothesis`, {}),
 };

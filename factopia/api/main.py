@@ -348,6 +348,9 @@ class DraftIn(BaseModel):
     groups: list[str] = []
     include_past_runs: bool = True
     idea_id: str | None = None          # 来自研究线索池（第 17 章）
+    idea_ids: list[str] = Field([], max_length=24)   # 合并转立项 / 追加线索：全部来源线索（第 17.12 节）
+    combo_id: str | None = None
+    based_on: str | None = Field(None, max_length=60)   # 追加线索：已有研究 <id>.v<版本>
 
 
 def _check_markets(markets: list[str]) -> None:
@@ -377,7 +380,7 @@ def factor_library(source: str | None = Query(None, pattern="^(alpha158|approved
 
 @app.get("/api/knowledge/search")
 def knowledge_search(q: str = Query(..., min_length=1, max_length=300), kinds: str | None = None, llm: bool = True):
-    """语义检索（BR-25）：因子库、内部研究、数据字典、经批准的外部公告；大模型多语言改写 + BM25。"""
+    """语义检索（BR-25）：因子库、内部研究、字段口径、经批准的外部公告；大模型多语言改写 + BM25。"""
     from factopia.research import semantic
     ks = [k for k in (kinds or "").split(",") if k in semantic.KIND_ZH] or None
     return semantic.search(q, ks, use_llm=llm)
@@ -479,9 +482,10 @@ def lock_version(body: dict):
         raise HTTPException(422, "立项预检命中阻断规则，不能锁定：" + "；".join(hits))
     spec["precheck_setup"] = pre
     saved = store.save_version(spec)
-    if (spec.get("ai_draft") or {}).get("idea_id"):          # 研究线索转立项（第 17.6 节）
+    ad = spec.get("ai_draft") or {}
+    for iid in dict.fromkeys([*([ad["idea_id"]] if ad.get("idea_id") else []), *(ad.get("idea_ids") or [])]):   # 研究线索转立项（第 17.6、17.12 节）
         from factopia import ideas
-        ideas.mark_converted(spec["ai_draft"]["idea_id"], saved["id"], saved["version"], LOCKED_BY)
+        ideas.mark_converted(iid, saved["id"], saved["version"], LOCKED_BY, ad.get("combo_id"))
     return saved
 
 
@@ -549,15 +553,17 @@ class IdeaSuggestIn(BaseModel):
     channel: str
     markets: list[str] = []
     avoid: list[str] = []
+    seed: str = Field("", max_length=500)       # 研究员的想法种子（可选）
+    skip_angle: str | None = None                # "换一个"时排除当前方向
 
 
 @app.post("/api/ideas/suggest")
 def ideas_suggest(body: IdeaSuggestIn):
-    """AI 默认假设（第 17.11 节）：投资假设 / 研究员经验 / 人工反馈渠道，每次不同。约 10–30 秒。"""
+    """AI 默认假设（第 17.11 节）：投资假设 / 研究员经验 / 人工反馈渠道；按平台证据选方向，或以研究员的想法种子为主线。约 10–30 秒。"""
     from factopia.ideas import suggest
     ms = [m for m in body.markets if access.can(m)] or access.markets()
     try:
-        return suggest.suggest(body.channel, ms, body.avoid[:20])
+        return suggest.suggest(body.channel, ms, body.avoid[:20], body.seed, body.skip_angle)
     except (_ideas().IdeaError, drafting.DraftError) as e:
         raise HTTPException(502 if isinstance(e, drafting.DraftError) else 422, str(e))
 
@@ -590,6 +596,35 @@ class IdeaActIn(BaseModel):
 def ideas_act(iid: str, body: IdeaActIn):
     _idea_check(iid)
     return _idea_call(_ideas().act, iid, body.action, body.by, body.note, body.target)
+
+
+class IdeaCombineIn(BaseModel):
+    ids: list[str] = Field(max_length=8)
+    by: str = Field(max_length=60)
+    base: str | None = Field(None, max_length=40)       # 追加到已有研究：研究编号
+
+
+@app.post("/api/ideas/combine")
+def ideas_combine(body: IdeaCombineIn):
+    """合并转立项（第 17.12 节）：多条线索由 AI 合成一个研究假设，或追加到已有研究。约 10–30 秒。"""
+    for iid in body.ids:
+        _idea_check(iid)
+    if body.base:
+        sp = _json_spec(body.base)
+        if not any(access.can(m) for m in sp.get("markets") or []):
+            access.deny(f"研究 {body.base}", (sp.get("markets") or [None])[0])
+    from factopia.ideas import combine
+    try:
+        return combine.combine(body.ids, body.by, body.base)
+    except (_ideas().IdeaError, drafting.DraftError) as e:
+        raise HTTPException(502 if isinstance(e, drafting.DraftError) else 422, str(e))
+
+
+def _json_spec(rid: str) -> dict:
+    vs = store.versions(rid) if drafting.ID_PATTERN.match(rid) else []
+    if not vs:
+        raise HTTPException(404, f"研究不存在或还没有锁定的版本：{rid}")
+    return store.load_version(rid, vs[-1])
 
 
 class IdeaConvertIn(BaseModel):
@@ -646,7 +681,9 @@ def _version_rules(research_id: str, version: int, overrides: dict) -> dict:
             "portfolio_source": {m: v["source"] for m, v in (pctx or {}).get("portfolio", {}).items()},
             "portfolio_note": None if has_pf else "还没有完成的运行：组合生成后才能做组合预检",
             "focus": {m: {"run_id": e.get("run_id"), "loop": (e.get("focus") or {}).get("loop")} for m, e in st["markets"].items()},
-            "overrides": overrides}
+            "overrides": overrides,
+            # 规则命中的处理状态（审批台的确认 / 例外）；合成违规演示时不显示
+            "handling": None if overrides else _approval_mod().handling(research_id, version)}
 
 
 @app.get("/api/research/{research_id}/versions/{version}/rules")
@@ -723,7 +760,8 @@ def _study_market(m: str, runs: list[dict], jobs: list[dict], rule: dict) -> dic
         bdiag = RESULTS / "runs" / run["run_id"] / "diagnostics" / "baseline.json"
         fo |= {"diagnostics": _json(diag) if diag.exists() else None,
                "baseline_diagnostics": _json(bdiag) if bdiag.exists() else None}
-        fo |= {"significance": sig, "credibility": verdict.credibility(val, sig, rule),
+        ties = _score_ties(run["run_id"], focus["loop"])
+        fo |= {"significance": sig, "ties": ties, "credibility": verdict.credibility(val, sig, rule, ties),
                "validation": _validation_summary(val), "validation_job": _job_public(vjob) if vjob else None}
     entry |= {"kind": run.get("kind", "rdagent"), "insufficient": run.get("insufficient"), "price_source": run.get("price_source"),
               "text_dataset": run.get("text_dataset"), "score_direction": run.get("score_direction", 1)}
@@ -743,6 +781,20 @@ def _signal_sig(run_id: str, loop, horizon: int) -> dict | None:
 def _cached_sig(p: Path, mtime: float, horizon: int) -> dict:
     df = pd.read_parquet(p)
     return vmetrics.significance(df.set_index("date")["rank_ic"], horizon)
+
+
+def _score_ties(run_id: str, loop) -> dict | None:
+    """测试期打分的并列情况（导出的 score 文件；持股分数线上并列的股票数，第 14.7 节）。"""
+    p = RESULTS / "runs" / run_id / "score" / f"{loop}.parquet"
+    if not p.exists():
+        return None
+    return _cached_ties(p, p.stat().st_mtime)
+
+
+@lru_cache(maxsize=256)
+def _cached_ties(p: Path, mtime: float) -> dict | None:
+    df = pd.read_parquet(p)
+    return vmetrics.ties(df.set_index(["date", "instrument"])["score"])
 
 
 def _validation(run_id: str, loop) -> dict | None:
@@ -1144,8 +1196,9 @@ def _materials(research_id: str, version: int) -> dict:
     # 待复核数只统计本研究各市场使用的真实文本数据集；模拟数据集（词典法标注、虚构公司）的复核要求不适用，记录在审批材料中
     used = [srcs.TEXT_DATASETS[m] for m in spec["markets"]] if uses_text else []
     real = [d for d in used if d not in srcs.SIMULATED]
-    pending = sum(treview.queue(d, "pending", 1)["counts"]["pending"] for d in real)
-    waived = {d: treview.queue(d, "pending", 1)["counts"]["pending"] for d in used if d in srcs.SIMULATED}
+    # 只有"必须复核"组（低置信度翻译，业务文档要求）未复核时阻止提交；抽样、高影响与其他组不阻止（第 14.9 节 v1.30）
+    pending = sum(treview.pending_must(d) for d in real)
+    waived = {d: treview.pending_must(d) for d in used if d in srcs.SIMULATED}
     return {"spec": spec, "study": study(research_id, version), "rules": _version_rules(research_id, version, {}),
             "portfolio": P.load(research_id, version), "report": {"name": reps[0].name, "path": reps[0]} if reps else None,
             "quality": _json(qp) if qp.exists() else None, "text_pending": pending,
@@ -1792,6 +1845,29 @@ def retry_job(job_id: str):
     return store.retry_job(job)
 
 
+class ResumeIn(BaseModel):
+    budget_usd: float | None = Field(None, gt=0, le=20)
+
+
+@app.get("/api/jobs/{job_id}/resume")
+def job_resume_info(job_id: str):
+    return store.resume_info(_load_job(job_id))
+
+
+@app.post("/api/jobs/{job_id}/resume")
+def resume_job(job_id: str, body: ResumeIn):
+    """从断点继续：同一任务重新排队，RD-Agent 从最近的检查点续跑剩下的轮数（已完成的轮次与费用保留）。"""
+    job = _load_job(job_id)
+    access.require(job["market"], "在该市场继续运行任务")
+    try:
+        job = store.resume_job(job, body.budget_usd)
+    except ValueError as e:
+        raise HTTPException(409, str(e))
+    if store.paused():                                    # 暂停原因已处理（如换了密钥）才会点续跑：一并恢复排队
+        store.resume()
+    return _job_public(job)
+
+
 @app.get("/api/runner")
 def runner_status():
     """后台运行器：是否暂停（及原因）、排队与运行中的任务数。"""
@@ -1867,18 +1943,25 @@ def text_overview():
                     "processing_delay_min": cfg["processing_delay_min"], "ready": bool(s),
                     "n_filings": s.get("n_filings", 0), "n_companies": s.get("n_companies", 0),
                     "n_changes": s.get("n_changes", 0), "hold_days": s.get("hold_days"),
-                    "evaluation": s.get("evaluation"), "truth": tcommon.read_json(d / "truth.json")})
+                    "evaluation": s.get("evaluation"), "truth": tcommon.read_json(d / "truth.json"),
+                    "sensitivity": tcommon.read_json(d / "sensitivity.json")})
     g = tcommon.glossary()
     concepts = [{"concept": c, "zh": v["zh_name"], "en": v["en_name"], "fr": v["fr_name"], "terms": v["terms"]}
                 for c, v in g["concepts"].items()]
     cmp = tcommon.read_json(tcommon.TEXT / "compare.json")
     if cmp and not access.cross_region():
         cmp = {**cmp, "markets": [r for r in cmp["markets"] if access.can(r["market"])]}
-    counts = {"pending": 0, "done": 0}
+    counts = {"pending": 0, "done": 0, "pending_real": 0, "pending_simulated": 0, "must_real": 0}
     for ds in _text_allowed():
-        for k, v in treview.queue(ds, limit=0)["counts"].items():
-            counts[k] += v
-    return {"datasets": out, "compare": cmp, "glossary_version": g["version"], "concepts": concepts, "review_counts": counts}
+        c = treview.queue(ds, limit=0)["counts"]
+        counts["pending"] += c["pending"]
+        counts["done"] += c["done"]
+        counts["pending_simulated" if tcommon.DATASETS[ds]["simulated"] else "pending_real"] += c["pending"]
+        if not tcommon.DATASETS[ds]["simulated"]:     # 只有真实数据"必须复核"组的待复核阻止提交审批
+            counts["must_real"] += c["tiers"]["must"]["pending"]
+    pl = tcommon.pipeline()
+    return {"datasets": out, "compare": cmp, "glossary_version": g["version"], "concepts": concepts, "review_counts": counts,
+            "pipeline": {"screening": pl["screening"], "review": pl["review"]}, "glossary_additions": g.get("additions", [])}
 
 
 @app.get("/api/text/{dataset}/filings")
@@ -1887,8 +1970,9 @@ def text_filings(dataset: str, instrument: str | None = None, limit: int = Query
     if not s:
         raise HTTPException(404, "该数据集尚未生成文本信号（先运行 python -m factopia.text all）")
     items = [f for f in s["filings"] if not instrument or f["instrument"] == instrument]
+    exc = [f for f in s.get("excluded") or [] if not instrument or f["instrument"] == instrument]
     return {"dataset": dataset, "simulated": s["simulated"], "source": s["source"], "licence": s["licence"],
-            "total": len(items), "items": items[:limit]}
+            "total": len(items), "items": items[:limit], "excluded": exc, "cleaning": s.get("cleaning")}
 
 
 @app.get("/api/text/{dataset}/filings/{doc_id}")
@@ -1930,14 +2014,47 @@ def text_search(q: str = "", dataset: list[str] | None = Query(None), concept: l
 
 @app.get("/api/text/review")
 def text_review_queue(status: str = Query("pending", pattern="^(pending|done|all)$"), dataset: str | None = None,
-                      limit: int = Query(100, le=500)):
+                      limit: int = Query(100, le=500), tier: str = Query("all", pattern="^(all|must|sample|impact|other)$")):
     if dataset:
         _text_ds(dataset)
-    elif not access.cross_region():                           # 地区视角：只看本地区数据集的复核队列
-        res = [treview.queue(ds, status, limit) for ds in _text_allowed()]
-        return {"items": [x for r in res for x in r["items"]][:limit], "actions": treview.ACTIONS,
-                "counts": {k: sum(r["counts"][k] for r in res) for k in ("pending", "done")}}
-    return treview.queue(dataset, status, limit)
+        return treview.queue(dataset, status, limit, tier)
+    res = [treview.queue(ds, status, limit, tier) for ds in _text_allowed()]   # 地区视角：只看本地区数据集的复核队列
+    order = {t: n for n, t in enumerate(treview.TIERS)}
+    return {"items": sorted([x for r in res for x in r["items"]], key=lambda it: order[it["tier"]])[:limit], "actions": treview.ACTIONS,
+            "tiers_zh": treview.TIERS,
+            "counts": {"pending": sum(r["counts"]["pending"] for r in res), "done": sum(r["counts"]["done"] for r in res),
+                       "tiers": {t: {k: sum(r["counts"]["tiers"][t][k] for r in res) for k in ("pending", "done")} for t in treview.TIERS}}}
+
+
+@app.get("/api/text/review/accuracy")
+def text_review_accuracy():
+    """抽样质检：大模型判断的准确率与术语表漏检率（真实数据集）。"""
+    return {"datasets": [treview.accuracy(ds) for ds in _text_allowed() if not tcommon.DATASETS[ds]["simulated"]]}
+
+
+@app.get("/api/text/glossary/candidates")
+def text_glossary_candidates():
+    """术语表扩充：AI 找到的候选术语、已批准的新增术语、生成记录。"""
+    from factopia.text import glossary_suggest
+    return glossary_suggest.candidates()
+
+
+class GlossaryDecisionIn(BaseModel):
+    action: str = Field(pattern="^(approve|reject)$")
+    by: str = Field(max_length=60)
+    note: str = Field("", max_length=300)
+    term: str | None = Field(None, max_length=80)
+
+
+@app.post("/api/text/glossary/candidates/{cid}")
+def text_glossary_decide(cid: str, body: GlossaryDecisionIn):
+    from factopia.text import glossary_suggest
+    try:
+        return glossary_suggest.decide(cid, body.action, body.by, body.note, body.term)
+    except KeyError as e:
+        raise HTTPException(404, str(e))
+    except ValueError as e:
+        raise HTTPException(422, str(e))
 
 
 class SummaryIn(BaseModel):
@@ -1981,7 +2098,7 @@ def text_review_decide(body: ReviewIn):
         raise HTTPException(422, str(e))
 
 
-# ---------------------------------------------------------------- 数据台：证券主数据、公司行动、数据字典、时间点一致性（Spec 第 14.10 节）
+# ---------------------------------------------------------------- 数据台：证券主数据、公司行动、口径与规则、时间点一致性（Spec 第 14.10 节）
 REFDATA = Path(os.environ.get("FACTOPIA_RUNTIME", "/workspace/runtime")) / "refdata"
 
 
@@ -2053,4 +2170,6 @@ def refdata_dictionary():
             d = pd.read_csv(p, dtype=str).fillna("")
             mem[mk] = {"rows": len(d), "sources": d["source"].value_counts().to_dict(),
                        "point_in_time": bool(len(d)) and not (d["source"] == "current_list").any()}
-    return {"fields": f, "markets": m, "membership": mem}
+    from factopia.text.common import DATASETS as TDS
+    text_delay = {mk: TDS[ds]["processing_delay_min"] for mk, ds in srcs.TEXT_DATASETS.items() if ds in TDS}
+    return {"fields": f, "markets": m, "membership": mem, "text_delay_min": text_delay}

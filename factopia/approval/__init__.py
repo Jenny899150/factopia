@@ -163,6 +163,27 @@ def summary(s: dict) -> dict:
         "step": s["current"], "steps": len(s["steps"]), "approved_markets": s.get("approved_markets"), "title": s["materials"]["title"]}
 
 
+def handling(research_id: str, version: int) -> dict | None:
+    """风控台显示规则命中的处理状态（第 14.12 节）：取该研究版本最新一次提交，列出每条命中由哪些角色处理、结论与理由。
+    键为 规则编号@市场（与审批步骤的 hits 一致）；提交时冻结的命中（frozen）用于发现提交后材料或规则的变化。"""
+    subs = [x for x in list_all(research_id) if x["version"] == version]
+    if not subs:
+        return None
+    s = load(subs[0]["id"])
+    pre = s["materials"]["prechecks"]
+    frozen = sorted({f"{h['rule_id']}@{h['market']}" for st in ("setup", "portfolio") for h in ((pre.get(st) or {}).get("hits") or [])})
+    items: dict[str, list[dict]] = {}
+    for st in s["steps"]:
+        for k in st["hits"]:
+            d = s["rule_decisions"].get(f"{st['role']}|{k}")
+            items.setdefault(k, []).append({"role": st["role"], "action": d["action"] if d else None,
+                                            "action_zh": ACTION_ZH.get(d["action"]) if d else None,
+                                            "note": d.get("note") if d else None, "at": d.get("at") if d else None,
+                                            "by": d.get("by") if d else None})
+    return {"submission_id": s["id"], "status": s["status"], "status_zh": STATUS_ZH[s["status"]], "created_at": s["created_at"],
+            "items": items, "frozen": frozen, "earlier_submissions": len(subs) - 1}
+
+
 # ---------------------------------------------------------------- 提交
 
 FACTOR_KEYS = ("name", "description", "formulation", "code", "kind", "dataset", "source", "simulated")   # kind = text：文本信号
@@ -222,6 +243,11 @@ def submit(m: dict, by: str, note: str = "") -> dict:
                          "rank_ic": ((e.get("focus") or {}).get("metrics") or {}).get("rank_ic"),
                          "rank_ic_t": ((e.get("focus") or {}).get("significance") or {}).get("t"),
                          "credibility": ((e.get("focus") or {}).get("credibility") or {}).get("label"),
+                         # 收益：单次回测与多次回测（并列排序种子）的中位数和区间；打分并列（第 14.7 节）
+                         "return_single": ((e.get("focus") or {}).get("metrics") or {}).get("annual_return_with_cost"),
+                         "return_median": (((e.get("focus") or {}).get("credibility") or {}).get("noise") or {}).get("median"),
+                         "return_range": (((e.get("focus") or {}).get("credibility") or {}).get("noise") or {}).get("range"),
+                         "ties": ((e.get("focus") or {}).get("ties") or {}).get("cutoff_tied_median"),
                          "kind": e.get("kind", "rdagent"), "simulated": bool((e.get("price_source") or {}).get("simulated")),
                          "insufficient": e.get("insufficient")} for mk, e in st["markets"].items()},
         "transfer": st.get("transfer"), "overall": st.get("overall"),
@@ -236,9 +262,15 @@ def submit(m: dict, by: str, note: str = "") -> dict:
         "translations": m.get("translations"),
         "idea": None,
     }
-    if (spec.get("ai_draft") or {}).get("idea_id"):           # 研究线索来源（第 17.6 节）
+    ad = spec.get("ai_draft") or {}
+    src_ids = list(dict.fromkeys([*([ad["idea_id"]] if ad.get("idea_id") else []), *(ad.get("idea_ids") or [])]))
+    if src_ids:                                               # 研究线索来源（第 17.6、17.12 节）
         from factopia import ideas
-        materials["idea"] = ideas.lineage(spec["ai_draft"]["idea_id"])
+        from factopia.ideas import combine
+        materials["idea"] = ideas.lineage(src_ids[0])
+        materials["ideas"] = [x for x in (ideas.lineage(i) for i in src_ids) if x]
+        cmb = combine.load(ad.get("combo_id") or "")
+        materials["idea_combo"] = {k: cmb.get(k) for k in ("id", "by", "at", "base", "sources", "hypothesis_cited", "conflicts", "not_testable", "model", "prompt_version")} if cmb else None
     tr_files = {}
     if (m.get("translations") or {}).get("datasets"):         # 冻结翻译：生效译文、概念、复核记录、术语表（第 14.22 节）
         from factopia.text import review as treview

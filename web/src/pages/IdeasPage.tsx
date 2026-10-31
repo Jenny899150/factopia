@@ -1,9 +1,10 @@
 import { useEffect, useState } from "react";
 import { Link, useNavigate, useSearchParams } from "react-router-dom";
 import { Badge, ErrorBox, Loading, Notice, Panel, Seg } from "../components/ui";
-import { api, visibleMarkets, type Idea, type IdeaChannel, type IdeaDetail, type IdeaInput, type IdeaList, type IdeaSuggestion, type Market } from "../api";
+import { api, visibleMarkets, type Idea, type IdeaChannel, type IdeaCombo, type IdeaDetail, type IdeaInput, type IdeaList, type IdeaSuggestion, type Market } from "../api";
 import { useDraft } from "../draft";
 import { MARKET_LABEL, useAsync } from "../lib";
+import SuggestionBasis from "../components/SuggestionBasis";
 
 // 研究线索池（Spec 第 17 章，EXT-01）：首页汇集多种信息输入渠道，统一为线索卡片，挑选后转为研究立项
 
@@ -33,7 +34,8 @@ function fileToBase64(f: File): Promise<string> {
   });
 }
 
-function Submit({ meta, actor, setActor, onCreated }: { meta: IdeaList; actor: string; setActor: (v: string) => void; onCreated: (i: Idea) => void }) {
+function Submit({ meta, actor, setActor, onCreated, onSuggestion }: { meta: IdeaList; actor: string; setActor: (v: string) => void; onCreated: (i: Idea) => void;
+  onSuggestion: (s: IdeaSuggestion | null) => void }) {
   const [ch, setCh] = useState<IdeaChannel>("hypothesis");
   const [title, setTitle] = useState("");
   const [body, setBody] = useState("");
@@ -48,11 +50,13 @@ function Submit({ meta, actor, setActor, onCreated }: { meta: IdeaList; actor: s
   const [sugBusy, setSugBusy] = useState(false);
   const [sugErr, setSugErr] = useState<string | null>(null);
   const [seen, setSeen] = useState<string[]>([]);
-  async function suggest(channel: IdeaChannel) {
+  const [seed, setSeed] = useState("");             // 研究员的想法种子：填了就以它为主线，不填由平台按证据选方向
+  async function suggest(channel: IdeaChannel, another = false) {
     if (channel === "paper") { setSug(null); return; }
     setSugBusy(true); setSugErr(null);
     try {
-      const r = await api.ideaSuggest(channel, markets.length ? markets : visibleMarkets(), seen.slice(-20));
+      const r = await api.ideaSuggest(channel, markets.length ? markets : visibleMarkets(), seen.slice(-20), seed.trim(),
+        another && !seed.trim() && sug ? sug.angle : null);
       setSug(r); setSeen((xs) => [...xs, r.title]);
       setTitle(r.title); setBody(r.body);
       setExtra((e) => ({ ...e, direction: r.direction, period: r.period, feedback_role: r.feedback_role }));
@@ -60,6 +64,7 @@ function Submit({ meta, actor, setActor, onCreated }: { meta: IdeaList; actor: s
     } catch (e) { setSugErr((e as Error).message); } finally { setSugBusy(false); }
   }
   useEffect(() => { suggest(ch); }, [ch]); // eslint-disable-line react-hooks/exhaustive-deps
+  useEffect(() => { onSuggestion(ch === "paper" ? null : sug); }, [sug, ch]); // eslint-disable-line react-hooks/exhaustive-deps
   const edited = !!sug && (sug.title !== title.trim() || sug.body !== body.trim());
   const x = (k: string) => extra[k] ?? "";
   const setX = (k: string, v: string) => setExtra((e) => ({ ...e, [k]: v }));
@@ -93,15 +98,24 @@ function Submit({ meta, actor, setActor, onCreated }: { meta: IdeaList; actor: s
           <div className="border border-accent/40 bg-accent/5 rounded p-3 text-sm flex flex-col gap-1">
             <div className="flex flex-wrap items-center gap-2">
               <Badge tone="accent">AI 默认假设</Badge>
-              {sug && <span className="text-xs text-faint">研究角度：{sug.angle} · {sug.model} · 提示词 {sug.prompt_version}{edited ? " · 已修改" : ""}</span>}
-              <button type="button" className="btn h-7 px-2 text-xs ml-auto" disabled={sugBusy} onClick={() => suggest(ch)}>{sugBusy ? "AI 生成中…" : "换一个"}</button>
+              {sug && <span className="text-xs text-faint">方向：{sug.angle}{sug.focus_market ? ` · 侧重${MARKET_LABEL[sug.focus_market]}` : ""} · {sug.model} · 提示词 {sug.prompt_version}{edited ? " · 已修改" : ""}</span>}
+              <button type="button" className="btn h-7 px-2 text-xs ml-auto" disabled={sugBusy} onClick={() => suggest(ch, true)}>{sugBusy ? "AI 生成中…" : seed.trim() ? "按想法生成" : "换一个"}</button>
             </div>
-            {sugBusy && !sug && <p className="text-muted">AI 正在根据平台数据、市场差异和因子库生成建议（约 5–20 秒）…</p>}
+            <label className="text-xs text-muted">你的想法（可选）：填一句话或几个关键词，AI 围绕它展开；不填则由平台按证据选方向
+              <input id="idea-seed" className="field mt-1 text-sm" value={seed} maxLength={500} onChange={(e) => setSeed(e.target.value)}
+                onKeyDown={(e) => { if (e.key === "Enter" && !sugBusy) { e.preventDefault(); suggest(ch, true); } }}
+                placeholder="例如：港股大跌之后放量的股票反弹更快" />
+            </label>
+            {sugBusy && !sug && <p className="text-muted">AI 正在根据平台证据生成建议（约 10–20 秒）…</p>}
             {sugErr && <p className="text-xs text-bad">{sugErr}</p>}
             {sug && <>
+              {sug.selection && sug.selection.length > 0 && <div className="text-xs">
+                <span className="text-faint">{sug.seed ? "依据：" : "为什么选这个方向（加分 / 减分项）："}</span>
+                <ul className="list-disc pl-4 mt-0.5 text-muted">{sug.selection.map((w) => <li key={w}>{w}</li>)}</ul>
+              </div>}
               <p className="text-muted">{sug.why_zh}</p>
-              {sug.grounds.length > 0 && <details className="text-xs text-faint"><summary className="cursor-pointer">AI 参考的平台知识（{sug.grounds.length} 条，只含名称与说明）</summary>
-                <ul className="list-disc pl-4 mt-1">{sug.grounds.map((g) => <li key={g}>{g.length > 140 ? `${g.slice(0, 140)}…` : g}</li>)}</ul></details>}
+              {sug.table && <a href="#suggestion-basis" className="text-xs text-accent hover:underline">
+                完整生成依据：{sug.inputs?.used.length ?? 0} 个数据维度 · {sug.table.length} 个方向 × {sug.dimensions?.length ?? 0} 项打分 · {sug.evidence?.length ?? 0} 条证据（引用 {sug.evidence?.filter((e) => e.cited).length ?? 0}）· 完整提示词 ↓</a>}
               <p className="text-xs text-faint">已预填到下方，可直接修改；{ch === "experience" ? "经验请改成你自己的观察。" : ch === "feedback" ? "反馈请改成真实收到的内容。" : "提交后研究员仍须挑选、立项并通过检验。"}</p>
             </>}
           </div>
@@ -163,10 +177,13 @@ function Submit({ meta, actor, setActor, onCreated }: { meta: IdeaList; actor: s
   );
 }
 
-function Card({ i, active, onClick }: { i: Idea; active: boolean; onClick: () => void }) {
+function Card({ i, active, onClick, checked, onCheck }: { i: Idea; active: boolean; onClick: () => void; checked: boolean; onCheck?: () => void }) {
   const dup = (i.similar?.ideas.length ?? 0) > 0;
   return (
-    <button type="button" onClick={onClick} className={`w-full text-left p-3 rounded border transition-colors ${active ? "border-accent/60 bg-accent/10" : "border-line hover:border-accent/40"}`}>
+    <div className={`flex gap-2 p-3 rounded border transition-colors ${checked ? "border-accent bg-accent/5" : active ? "border-accent/60 bg-accent/10" : "border-line hover:border-accent/40"}`}>
+    {onCheck ? <input id={`idea-pick-${i.id}`} type="checkbox" className="mt-1 shrink-0" checked={checked} onChange={onCheck} aria-label={`选择线索：${i.title}`} />
+      : <span className="w-[13px] shrink-0" title="重复 / 不跟进的线索不能合并" />}
+    <button type="button" onClick={onClick} className="min-w-0 flex-1 text-left">
       <div className="flex flex-wrap items-center gap-1.5">
         <Badge tone={AUTO.has(i.channel) ? "warn" : "accent"}>{i.channel_zh}</Badge>
         <Badge tone={STATUS_TONE[i.status]}>{({ new: "待处理", converted: "已转立项", duplicate: "重复", dismissed: "不跟进" })[i.status]}</Badge>
@@ -178,6 +195,7 @@ function Card({ i, active, onClick }: { i: Idea; active: boolean; onClick: () =>
       <div className="text-xs text-muted mt-0.5 line-clamp-2">{i.excerpt}</div>
       <div className="text-xs text-faint mt-1">{i.submitted_by} · {i.markets.length ? i.markets.map((m) => MARKET_LABEL[m]).join(" / ") : "不限市场"}</div>
     </button>
+    </div>
   );
 }
 
@@ -186,6 +204,93 @@ function SourceLink({ ref_ }: { ref_: Record<string, string> }) {
   if (ref_.submission) return <Link className="text-accent" to="/approvals">审批台 · {ref_.submission}</Link>;
   if (ref_.research) return <Link className="text-accent" to="/portfolio">组合台 · {ref_.research}</Link>;
   return null;
+}
+
+// 合并转立项（Spec 第 17.12 节）：勾选多条线索由 AI 合成一个研究假设；或把新线索追加到已有研究，锁定为新版本
+function CombineBar({ picked, items, actor, onClear, onDone }: { picked: string[]; items: Idea[]; actor: string; onClear: () => void; onDone: (c: IdeaCombo) => void }) {
+  const projects = useAsync(() => api.projects(), []);
+  const [base, setBase] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+  const who = actor.trim();
+  const studies = (projects.data ?? []).filter((p) => !p.example && p.versions.length > 0);
+  const enough = base ? picked.length >= 1 : picked.length >= 2;
+  const titles = picked.map((id) => items.find((i) => i.id === id)?.title ?? id);
+  const go = async () => {
+    setBusy(true); setErr(null);
+    try { onDone(await api.ideaCombine(picked, who, base || null)); } catch (e) { setErr((e as Error).message); } finally { setBusy(false); }
+  };
+  return (
+    <div className="panel p-3 flex flex-col gap-2 text-sm border-accent/50">
+      <div className="flex flex-wrap items-center gap-2">
+        <span className="label">已选 {picked.length} 条</span>
+        <span className="text-muted min-w-0 truncate max-w-[60ch]">{titles.join("；")}</span>
+        <button type="button" className="btn h-7 px-2 text-xs ml-auto" onClick={onClear}>清空</button>
+      </div>
+      <div className="flex flex-wrap items-center gap-2">
+        <label htmlFor="combine-base" className="text-xs text-faint">方式</label>
+        <select id="combine-base" className="field h-8 w-auto max-w-full" value={base} onChange={(e) => setBase(e.target.value)}>
+          <option value="">合并为一个新研究（至少 2 条）</option>
+          {studies.map((p) => <option key={p.id} value={p.id}>追加到已有研究：{p.title}（{p.id} v{p.versions[p.versions.length - 1]}）</option>)}
+        </select>
+        <button type="button" className="btn btn-primary h-8" disabled={busy || !enough || !who} onClick={go}>
+          {busy ? "AI 正在合成研究假设（约 10–30 秒）…" : base ? "AI 合成追加假设" : "AI 合并为一个研究假设"}</button>
+      </div>
+      {!who && <p className="text-xs text-warn">请先在左侧填写提交人 / 处理人。</p>}
+      {err && <ErrorBox error={err} />}
+    </div>
+  );
+}
+
+function CombineResult({ c, onClose }: { c: IdeaCombo; onClose: () => void }) {
+  const { update } = useDraft();
+  const navigate = useNavigate();
+  const go = () => {
+    update({ hypothesis: c.hypothesis, direction: c.direction, markets: c.markets, ideaId: null, ideaIds: c.idea_ids, comboId: c.id,
+      basedOn: c.base ? { id: c.base.id, version: c.base.version } : null, ideaTitle: c.title });
+    navigate("/research");
+  };
+  const tagTitle = (t: string) => t === "B" ? `已有研究 ${c.base?.id} v${c.base?.version}` : c.sources.find((s) => s.tag === t)?.title ?? t;
+  const parts = c.hypothesis_cited.split(/(\[(?:I\d+|B)\])/g);
+  return (
+    <Panel eyebrow={`${c.id} · ${c.model} · 提示词 ${c.prompt_version} · ${c.by}`} title={c.base ? `追加到 ${c.base.title}：${c.title}` : `合并假设：${c.title}`}
+      actions={<button type="button" className="btn h-7 px-2 text-xs" onClick={onClose}>关闭</button>}>
+      <div className="grid gap-5 xl:grid-cols-[minmax(0,7fr)_minmax(0,5fr)]">
+        <div className="flex flex-col gap-3 min-w-0">
+          <div>
+            <div className="label mb-1">AI 合成的研究假设（每句后标明来源）</div>
+            <p className="text-sm leading-relaxed">{parts.map((x, k) => /^\[(I\d+|B)\]$/.test(x)
+              ? <span key={k} className="num text-[11px] text-accent align-super cursor-help" title={tagTitle(x.slice(1, -1))}>{x}</span> : <span key={k}>{x}</span>)}</p>
+          </div>
+          {c.direction && <p className="text-sm text-muted">方向：{c.direction}</p>}
+          <p className="text-xs text-muted">{c.why_zh}</p>
+          {c.conflicts.length > 0 && <Notice tone="warn" title="线索之间的矛盾">{c.conflicts.map((x, k) => <div key={k}>· {x}</div>)}</Notice>}
+          {c.not_testable.length > 0 && <Notice tone="accent" title="平台数据做不到、已排除的部分">{c.not_testable.map((x, k) => <div key={k}>· {x}</div>)}</Notice>}
+          <div className="flex flex-wrap items-center gap-2">
+            <button type="button" className="btn btn-primary" onClick={go}>用这条假设转立项</button>
+            <span className="text-xs text-faint">在研究立项页可以修改；锁定研究版本时，所有来源线索才标记为"已转立项"。</span>
+          </div>
+        </div>
+        <div className="flex flex-col gap-2 min-w-0">
+          <div className="label">来源线索</div>
+          <ul className="text-sm flex flex-col gap-1.5">
+            {c.base && <li><span className="num text-xs text-accent mr-1.5">[B]</span>已有研究 {c.base.title}（{c.base.id} v{c.base.version}）
+              {c.base.inherited.length > 0 && <span className="text-xs text-faint">，原来源线索 {c.base.inherited.join("、")}</span>}</li>}
+            {c.sources.map((s) => {
+              const use = c.uses.find((u) => u.tag === s.tag);
+              return (
+                <li key={s.tag}>
+                  <span className="num text-xs text-accent mr-1.5">[{s.tag}]</span><Badge tone="muted">{s.channel_zh}</Badge> {s.title}
+                  {c.unused.includes(s.tag) && <Badge tone="warn">假设中未引用</Badge>}
+                  {use?.how_zh && <div className="text-xs text-muted ml-7">{use.how_zh}</div>}
+                </li>
+              );
+            })}
+          </ul>
+        </div>
+      </div>
+    </Panel>
+  );
 }
 
 function Detail({ id, actor, onChanged }: { id: string; actor: string; onChanged: () => void }) {
@@ -219,7 +324,8 @@ function Detail({ id, actor, onChanged }: { id: string; actor: string; onChanged
   };
   const convert = () => run(async () => {
     const p = await api.ideaPrefill(d.id, picked);
-    update({ hypothesis: p.hypothesis, direction: p.direction, markets: p.markets, ideaId: p.idea_id, ideaTitle: `${p.channel_zh} · ${p.title}` });
+    update({ hypothesis: p.hypothesis, direction: p.direction, markets: p.markets, ideaId: p.idea_id, ideaTitle: `${p.channel_zh} · ${p.title}`,
+      ideaIds: [], comboId: null, basedOn: null });
     navigate("/research");
   });
   const who = actor.trim();
@@ -249,7 +355,11 @@ function Detail({ id, actor, onChanged }: { id: string; actor: string; onChanged
               </>}
             </div>
           )}
-          {d.ai_suggested && <div className="text-xs text-faint">采用 AI 默认假设（{d.ai_suggested.model} · {d.ai_suggested.prompt_version} · 研究角度：{d.ai_suggested.angle}）{d.ai_suggested.edited ? "，提交人已修改" : "，未修改"}</div>}
+          {d.ai_suggested && <div className="text-xs text-faint">采用 AI 默认假设（{d.ai_suggested.model} · {d.ai_suggested.prompt_version} · 方向：{d.ai_suggested.angle}）{d.ai_suggested.edited ? "，提交人已修改" : "，未修改"}
+            {d.ai_suggested.seed && <div>研究员的想法：{d.ai_suggested.seed}</div>}
+            {d.ai_suggested.selection && d.ai_suggested.selection.length > 0 && <div>选择依据：{d.ai_suggested.selection.join("；")}</div>}
+            {"table" in d.ai_suggested && <details className="mt-1"><summary className="cursor-pointer text-accent">查看提交时的完整生成依据</summary>
+              <div className="mt-2"><SuggestionBasis s={d.ai_suggested as unknown as IdeaSuggestion} /></div></details>}</div>}
           {d.document && (
             <div className="text-sm border border-line rounded p-3 flex flex-col gap-1">
               <div className="label">文档</div>
@@ -346,6 +456,10 @@ export default function IdeasPage() {
   const set = (k: string, v: string) => { const p = new URLSearchParams(params); if (v) p.set(k, v); else p.delete(k); setParams(p); };
   const meta = list.data;
   const sel = params.get("id") ?? meta?.items[0]?.id ?? "";
+  const [picked, setPicked] = useState<string[]>([]);
+  const [combo, setCombo] = useState<IdeaCombo | null>(null);
+  const [sugShown, setSugShown] = useState<IdeaSuggestion | null>(null);
+  const pick = (id: string) => setPicked((xs) => xs.includes(id) ? xs.filter((x) => x !== id) : xs.length >= 8 ? xs : [...xs, id]);
   return (
     <div className="flex flex-col gap-5">
       <div className="flex flex-wrap items-end gap-3">
@@ -369,8 +483,9 @@ export default function IdeasPage() {
         </div>
       )}
       <div className="grid gap-5 xl:grid-cols-[minmax(0,5fr)_minmax(0,7fr)]">
-        {meta ? <Submit meta={meta} actor={actor} setActor={setActor} onCreated={(i) => { list.reload(); set("id", i.id); }} /> : <Loading what="线索池" />}
+        {meta ? <Submit meta={meta} actor={actor} setActor={setActor} onCreated={(i) => { list.reload(); set("id", i.id); }} onSuggestion={setSugShown} /> : <Loading what="线索池" />}
         <Panel eyebrow="人工提交（蓝）与自动回流（橙）" title={`线索（${meta?.items.length ?? 0}）`}>
+          <p className="text-xs text-faint mb-2">点卡片查看并单独转立项；勾选多条可以合并为一个研究，或追加到已有研究（最多 8 条）。</p>
           <div className="flex flex-wrap items-center gap-2 mb-3">
             <Seg label="状态" value={st} onChange={(v) => set("status", v === "new" ? "" : v)}
               options={[{ value: "new", label: "待处理" }, { value: "converted", label: "已转立项" }, { value: "duplicate", label: "重复" }, { value: "dismissed", label: "不跟进" }, { value: "all", label: "全部" }]} />
@@ -379,11 +494,15 @@ export default function IdeasPage() {
           </div>
           {list.loading && !meta ? <Loading what="线索" /> : meta && meta.items.length === 0 ? <p className="text-sm text-muted">没有符合条件的线索。</p> : (
             <div className="flex flex-col gap-2 max-h-[40rem] overflow-y-auto pr-1">
-              {meta?.items.map((i) => <Card key={i.id} i={i} active={i.id === sel} onClick={() => set("id", i.id)} />)}
+              {meta?.items.map((i) => <Card key={i.id} i={i} active={i.id === sel} onClick={() => set("id", i.id)} checked={picked.includes(i.id)}
+                onCheck={i.status === "new" || i.status === "converted" ? () => pick(i.id) : undefined} />)}
             </div>
           )}
         </Panel>
       </div>
+      {sugShown && <SuggestionBasis key={sugShown.id} s={sugShown} />}
+      {picked.length > 0 && <CombineBar picked={picked} items={meta?.items ?? []} actor={actor} onClear={() => setPicked([])} onDone={setCombo} />}
+      {combo && <CombineResult key={combo.id} c={combo} onClose={() => setCombo(null)} />}
       {sel && <Detail key={sel} id={sel} actor={actor} onChanged={list.reload} />}
     </div>
   );
